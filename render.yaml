@@ -1,0 +1,32 @@
+services:
+  - type: worker
+    name: telegram-member-adder
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -u add_mem.py
+    envVars:
+      - key: TELEGRAM_API_ID
+        sync: false
+      - key: TELEGRAM_API_HASH
+        sync: false
+      - key: TELEGRAM_SESSION_STRING
+        sync: false
+      - key: SOURCE_GROUP_ID
+        value: "-1001937901847"
+      - key: TARGET_GROUP_ID
+        value: "-1002000540919"
+      - key: MAX_SUCCESSFUL_ADDS
+        value: "100"
+      - key: INVITE_DELAY_SECONDS
+        value: "60"
+      - key: RUN_FOREVER
+        value: "true"
+      - key: IDLE_SLEEP_SECONDS
+        value: "300"
+      - key: RETRY_ON_FATAL_SECONDS
+        value: "30"
+      - key: CSV_DIR
+        value: "csv"
+      - key: CSV_FILE
+        value: "scraped_members.csv"
