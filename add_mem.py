@@ -1,6 +1,6 @@
 from telethon import TelegramClient, errors, utils
 from telethon.sessions import StringSession
-from telethon.tl.functions.channels import InviteToChannelRequest
+from telethon.tl.functions.channels import GetParticipantRequest, InviteToChannelRequest
 from telethon.tl.functions.messages import AddChatUserRequest
 from telethon.tl.types import Channel, Chat, InputUser
 import csv
@@ -24,10 +24,21 @@ def read_bool_env(key, default):
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+def read_group_target_env(key, default):
+    raw = os.getenv(key)
+    if raw is None or raw.strip() == "":
+        return default
+
+    value = raw.strip()
+    if value.lstrip("-").isdigit():
+        return int(value)
+    return value
+
+
 load_dotenv()
 
-SOURCE_GROUP_ID = read_int_env("SOURCE_GROUP_ID", -1001937901847)
-TARGET_GROUP_ID = read_int_env("TARGET_GROUP_ID", -1002000540919)
+SOURCE_GROUP_ID = read_group_target_env("SOURCE_GROUP_ID", -1001937901847)
+TARGET_GROUP_ID = read_group_target_env("TARGET_GROUP_ID", -1002000540919)
 MAX_SUCCESSFUL_ADDS = read_int_env("MAX_SUCCESSFUL_ADDS", 0)
 INVITE_DELAY_SECONDS = max(0, read_int_env("INVITE_DELAY_SECONDS", 60))
 FLOODWAIT_HEARTBEAT_SECONDS = max(5, read_int_env("FLOODWAIT_HEARTBEAT_SECONDS", 60))
@@ -36,6 +47,11 @@ SAFE_DELAY_AFTER_FLOODWAIT = max(10, read_int_env("SAFE_DELAY_AFTER_FLOODWAIT", 
 DELAY_AFTER_EACH_USER = read_bool_env("DELAY_AFTER_EACH_USER", True)
 STOP_ON_PEERFLOOD = read_bool_env("STOP_ON_PEERFLOOD", True)
 PEERFLOOD_COOLDOWN_SECONDS = max(60, read_int_env("PEERFLOOD_COOLDOWN_SECONDS", 1800))
+MAX_FLOODWAIT_SECONDS = max(0, read_int_env("MAX_FLOODWAIT_SECONDS", 3600))
+ENABLE_SKIP_CACHE = read_bool_env("ENABLE_SKIP_CACHE", True)
+SKIP_CACHE_FILE = os.getenv("SKIP_CACHE_FILE", "invite_skip_cache.txt")
+PRELOAD_TARGET_MEMBER_IDS = read_bool_env("PRELOAD_TARGET_MEMBER_IDS", True)
+TARGET_MEMBER_PRELOAD_LIMIT = max(0, read_int_env("TARGET_MEMBER_PRELOAD_LIMIT", 200000))
 
 CSV_DIR = os.getenv("CSV_DIR", "csv")
 CSV_FILE = os.getenv("CSV_FILE", "scraped_members.csv")
@@ -79,6 +95,12 @@ print("Delay after each user:", DELAY_AFTER_EACH_USER)
 print("FloodWait heartbeat:", FLOODWAIT_HEARTBEAT_SECONDS, "seconds")
 print("Stop on PeerFlood:", STOP_ON_PEERFLOOD)
 print("PeerFlood cooldown:", PEERFLOOD_COOLDOWN_SECONDS, "seconds")
+if MAX_FLOODWAIT_SECONDS > 0:
+    print("Max accepted FloodWait:", MAX_FLOODWAIT_SECONDS, "seconds")
+else:
+    print("Max accepted FloodWait: disabled (wait any duration)")
+print("Skip cache enabled:", ENABLE_SKIP_CACHE)
+print("Preload target members:", PRELOAD_TARGET_MEMBER_IDS)
 print("Run forever:", RUN_FOREVER)
 
 
@@ -173,6 +195,68 @@ def reached_success_limit(success_count):
     return SUCCESS_LIMIT_ENABLED and success_count >= MAX_SUCCESSFUL_ADDS
 
 
+def normalize_username(username):
+    value = (username or "").strip().lower()
+    if value.startswith("@"):
+        return value[1:]
+    return value
+
+
+def build_user_keys(username, user_id):
+    keys = set()
+    normalized_username = normalize_username(username)
+    if normalized_username:
+        keys.add(f"u:{normalized_username}")
+
+    raw_user_id = (user_id or "").strip()
+    if raw_user_id.lstrip("-").isdigit():
+        keys.add(f"id:{int(raw_user_id)}")
+    return keys
+
+
+def resolve_skip_cache_path():
+    if os.path.isabs(SKIP_CACHE_FILE):
+        return SKIP_CACHE_FILE
+    return os.path.join(CSV_DIR, SKIP_CACHE_FILE)
+
+
+def load_skip_keys(cache_path):
+    if not ENABLE_SKIP_CACHE:
+        return set()
+
+    if not os.path.exists(cache_path):
+        return set()
+
+    loaded = set()
+    with open(cache_path, encoding="utf-8") as cache_file:
+        for line in cache_file:
+            key = line.strip()
+            if not key:
+                continue
+            loaded.add(key)
+    return loaded
+
+
+def save_skip_keys(cache_path, skip_keys):
+    if not ENABLE_SKIP_CACHE:
+        return
+
+    cache_dir = os.path.dirname(cache_path)
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+
+    with open(cache_path, "w", encoding="utf-8") as cache_file:
+        for key in sorted(skip_keys):
+            cache_file.write(key + "\n")
+
+
+class ExcessiveFloodWaitError(RuntimeError):
+    def __init__(self, seconds, user_label):
+        self.seconds = int(seconds)
+        self.user_label = user_label
+        super().__init__(f"FloodWait {self.seconds}s for {self.user_label}")
+
+
 async def resolve_input_user(username, user_id, access_hash, user_label):
     # Prefer id+access_hash from CSV to avoid username resolve rate limits.
     if username and username.lstrip("-").isdigit() and not user_id:
@@ -201,6 +285,74 @@ async def invite_user(group, user):
         await client(AddChatUserRequest(group.id, user, fwd_limit=0))
     else:
         raise TypeError(f"Unsupported group type: {type(group).__name__}")
+
+
+async def is_user_already_in_group(group, user, user_label):
+    # Pre-check is only available for Channel/Supergroup via GetParticipantRequest.
+    if not isinstance(group, Channel):
+        return False
+
+    while True:
+        try:
+            await client(GetParticipantRequest(group, user))
+            return True
+        except (
+            errors.UserNotParticipantError,
+            errors.ParticipantIdInvalidError,
+            errors.UserIdInvalidError,
+        ):
+            return False
+        except errors.ChatAdminRequiredError:
+            print(
+                "\nMembership pre-check requires additional admin rights. "
+                "Falling back to direct invite attempt."
+            )
+            return False
+        except errors.FloodWaitError as e:
+            print(f"\nFloodWait while checking membership for {user_label}: {e.seconds} seconds")
+            await wait_with_heartbeat(e.seconds, FLOODWAIT_HEARTBEAT_SECONDS, "Membership check")
+        except Exception as e:
+            print(
+                f"\nMembership check failed for {user_label}: "
+                f"{type(e).__name__}: {e}. Trying invite directly."
+            )
+            return False
+
+
+async def preload_target_member_ids(group):
+    if not PRELOAD_TARGET_MEMBER_IDS:
+        return set()
+    if not isinstance(group, (Channel, Chat)):
+        return set()
+
+    print("\nPreloading target member IDs to reduce unnecessary invite attempts...")
+    member_ids = set()
+    loaded = 0
+    try:
+        async for participant in client.iter_participants(group):
+            member_ids.add(participant.id)
+            loaded += 1
+            if TARGET_MEMBER_PRELOAD_LIMIT > 0 and loaded >= TARGET_MEMBER_PRELOAD_LIMIT:
+                print(
+                    "Target member preload limit reached: "
+                    f"{TARGET_MEMBER_PRELOAD_LIMIT}"
+                )
+                break
+    except errors.ChatAdminRequiredError:
+        print(
+            "Could not preload target members (admin permission required). "
+            "Continuing without preload."
+        )
+        return set()
+    except Exception as e:
+        print(
+            f"Could not preload target members: {type(e).__name__}: {e}. "
+            "Continuing without preload."
+        )
+        return set()
+
+    print(f"Preloaded target members: {len(member_ids)}")
+    return member_ids
 
 
 async def wait_with_heartbeat(total_seconds, heartbeat_seconds, prefix):
@@ -232,6 +384,8 @@ async def invite_with_floodwait_retry(target_group, user, user_label, current_in
             return current_invite_delay
         except errors.FloodWaitError as e:
             print(f"\nFloodWait received for {user_label}: {e.seconds} seconds")
+            if MAX_FLOODWAIT_SECONDS > 0 and e.seconds > MAX_FLOODWAIT_SECONDS:
+                raise ExcessiveFloodWaitError(e.seconds, user_label)
             await wait_with_heartbeat(e.seconds, FLOODWAIT_HEARTBEAT_SECONDS, "FloodWait")
 
             if AUTO_RAISE_DELAY_ON_FLOODWAIT and current_invite_delay < SAFE_DELAY_AFTER_FLOODWAIT:
@@ -298,7 +452,21 @@ async def main():
         return
     except Exception as e:
         print(f"Error loading groups: {e}")
+        if "Could not find the input entity" in str(e):
+            print("\nQuick checks:")
+            print("1. For supergroups/channels, use full ID format: -100xxxxxxxxxx")
+            print("2. Or set TARGET_GROUP_ID as @public_username / https://t.me/public_username")
+            print("3. This Telegram account must be a member/admin of target group")
         return
+
+    skip_cache_path = resolve_skip_cache_path()
+    skip_keys = load_skip_keys(skip_cache_path)
+    skip_cache_loaded_count = len(skip_keys)
+    if ENABLE_SKIP_CACHE:
+        print(f"Skip cache file: {skip_cache_path}")
+        print(f"Skip cache entries loaded: {skip_cache_loaded_count}")
+
+    target_member_ids = await preload_target_member_ids(target_group)
 
     csv_path = os.path.join(CSV_DIR, CSV_FILE)
     if not os.path.exists(csv_path):
@@ -306,10 +474,19 @@ async def main():
         print("Run mem_scrap.py first to scrape source group members.")
         return
 
+    skipped_missing_username_in_csv = 0
     with open(csv_path, encoding="utf-8") as f:
         reader = csv.reader(f)
         next(reader, None)
-        rows = [row for row in reader if row]
+        rows = []
+        for row in reader:
+            if not row:
+                continue
+            username_in_row = row[0].strip() if len(row) > 0 else ""
+            if not username_in_row:
+                skipped_missing_username_in_csv += 1
+                continue
+            rows.append(row)
 
     total_users = len(rows)
     if total_users == 0:
@@ -321,6 +498,11 @@ async def main():
     print("=" * 60)
     print(f"CSV file: {csv_path}")
     print(f"Users found in CSV: {total_users}")
+    if skipped_missing_username_in_csv > 0:
+        print(
+            "Skipped before processing (missing username in CSV): "
+            f"{skipped_missing_username_in_csv}"
+        )
     if SUCCESS_LIMIT_ENABLED:
         print(f"Will stop after {MAX_SUCCESSFUL_ADDS} successful additions.")
     else:
@@ -334,6 +516,9 @@ async def main():
 
     success_count = 0
     fail_count = 0
+    already_in_group_count = 0
+    skipped_missing_username_count = 0
+    skipped_by_cache_count = 0
     processed_count = 0
     fatal_stop_reason = ""
 
@@ -349,14 +534,27 @@ async def main():
         username = row[0].strip() if len(row) > 0 else ""
         user_id = row[1].strip() if len(row) > 1 else ""
         access_hash = row[2].strip() if len(row) > 2 else ""
-        user_label = username or user_id or f"row-{index}"
+        user_label = username or f"row-{index}"
+        row_keys = build_user_keys(username, user_id)
 
-        if not username and not user_id:
-            print(f"\nSkipped empty row at index {index}")
-            fail_count += 1
+        if not username:
+            skipped_missing_username_count += 1
+            print(f"\nSkipped (username missing) at index {index}")
             print("\r" + render_progress(processed_count, total_users, success_count), end="")
-            if DELAY_AFTER_EACH_USER and processed_count < total_users and not reached_success_limit(success_count):
-                await wait_between_users(current_invite_delay)
+            continue
+
+        if ENABLE_SKIP_CACHE and row_keys and any(key in skip_keys for key in row_keys):
+            skipped_by_cache_count += 1
+            print(f"\nSkipped by cache: {user_label}")
+            print("\r" + render_progress(processed_count, total_users, success_count), end="")
+            continue
+
+        if user_id and user_id.lstrip("-").isdigit() and int(user_id) in target_member_ids:
+            already_in_group_count += 1
+            if ENABLE_SKIP_CACHE:
+                skip_keys.update(row_keys)
+            print(f"\nAlready in target group (preloaded check), skipped: {user_label}")
+            print("\r" + render_progress(processed_count, total_users, success_count), end="")
             continue
 
         user = None
@@ -366,12 +564,25 @@ async def main():
                 user = await resolve_input_user(username, user_id, access_hash, user_label)
             except (ValueError, errors.rpcerrorlist.UsernameInvalidError, errors.rpcerrorlist.UserIdInvalidError):
                 print(f"\nInvalid user format or not found: {user_label}")
+                if ENABLE_SKIP_CACHE:
+                    skip_keys.update(row_keys)
                 fail_count += 1
                 print("\r" + render_progress(processed_count, total_users, success_count), end="")
                 continue
             except Exception as e:
                 print(f"\nError getting user {user_label}: {e}")
                 fail_count += 1
+                print("\r" + render_progress(processed_count, total_users, success_count), end="")
+                continue
+
+            resolved_user_id = str(getattr(user, "user_id", "") or user_id).strip()
+            resolved_keys = build_user_keys(username, resolved_user_id or user_id)
+
+            if await is_user_already_in_group(target_group, user, user_label):
+                already_in_group_count += 1
+                if ENABLE_SKIP_CACHE:
+                    skip_keys.update(resolved_keys)
+                print(f"\nAlready in target group, skipped: {user_label}")
                 print("\r" + render_progress(processed_count, total_users, success_count), end="")
                 continue
 
@@ -382,6 +593,8 @@ async def main():
                 current_invite_delay,
             )
             success_count += 1
+            if resolved_user_id and resolved_user_id.lstrip("-").isdigit():
+                target_member_ids.add(int(resolved_user_id))
             print(f"\nAdded: {user_label}")
             print("\r" + render_progress(processed_count, total_users, success_count), end="")
 
@@ -396,16 +609,29 @@ async def main():
 
         except errors.UserPrivacyRestrictedError:
             print(f"\nPrivacy restricted: {user_label}")
+            if ENABLE_SKIP_CACHE:
+                skip_keys.update(row_keys)
             fail_count += 1
             print("\r" + render_progress(processed_count, total_users, success_count), end="")
 
         except errors.UserNotMutualContactError:
             print(f"\nCannot add (not mutual contact): {user_label}")
+            if ENABLE_SKIP_CACHE:
+                skip_keys.update(row_keys)
             fail_count += 1
+            print("\r" + render_progress(processed_count, total_users, success_count), end="")
+
+        except errors.UserAlreadyParticipantError:
+            already_in_group_count += 1
+            if ENABLE_SKIP_CACHE:
+                skip_keys.update(row_keys)
+            print(f"\nAlready in target group, skipped: {user_label}")
             print("\r" + render_progress(processed_count, total_users, success_count), end="")
 
         except errors.UserIdInvalidError:
             print(f"\nInvalid ID: {user_label}")
+            if ENABLE_SKIP_CACHE:
+                skip_keys.update(row_keys)
             fail_count += 1
             print("\r" + render_progress(processed_count, total_users, success_count), end="")
 
@@ -415,6 +641,15 @@ async def main():
                 f"{type(e).__name__}: {e}"
             )
             print(f"\nFATAL: {fatal_stop_reason}")
+            should_wait_before_next_user = False
+            break
+        except ExcessiveFloodWaitError as e:
+            fatal_stop_reason = (
+                f"FloodWait too long for {e.user_label}: {e.seconds} seconds "
+                f"(MAX_FLOODWAIT_SECONDS={MAX_FLOODWAIT_SECONDS})."
+            )
+            print(f"\nFATAL: {fatal_stop_reason}")
+            print("Stopping this cycle. Retry later or increase INVITE_DELAY_SECONDS.")
             should_wait_before_next_user = False
             break
 
@@ -449,21 +684,46 @@ async def main():
     elif fatal_stop_reason:
         print(f"Stopped early due to fatal invite error: {fatal_stop_reason}")
 
+    skip_cache_final_count = len(skip_keys)
+    skip_cache_added_count = max(0, skip_cache_final_count - skip_cache_loaded_count)
+    if ENABLE_SKIP_CACHE:
+        try:
+            save_skip_keys(skip_cache_path, skip_keys)
+            if skip_cache_added_count > 0:
+                print(
+                    f"Skip cache updated: +{skip_cache_added_count} "
+                    f"(total {skip_cache_final_count})"
+                )
+            else:
+                print(f"Skip cache unchanged (total {skip_cache_final_count})")
+        except Exception as e:
+            print(f"Warning: could not save skip cache: {type(e).__name__}: {e}")
+
     print("\n" + "=" * 60)
     print("PROCESS COMPLETE - SUMMARY")
     print("=" * 60)
     print(f"Users in CSV: {total_users}")
     print(f"Users processed: {processed_count}")
     print(f"Successfully added: {success_count}")
+    print(f"Already in target group (skipped): {already_in_group_count}")
+    print(f"Skipped (username missing): {skipped_missing_username_count}")
+    print(f"Skipped by cache: {skipped_by_cache_count}")
     print(f"Failed to add: {fail_count}")
     print(f"Configured success limit: {SUCCESS_LIMIT_LABEL}")
+    if ENABLE_SKIP_CACHE:
+        print(f"Skip cache total entries: {skip_cache_final_count}")
     print("=" * 60)
 
     return {
         "users_in_csv": total_users,
         "users_processed": processed_count,
         "successfully_added": success_count,
+        "already_in_target_group": already_in_group_count,
+        "skipped_missing_username": skipped_missing_username_count,
+        "skipped_by_cache": skipped_by_cache_count,
         "failed_to_add": fail_count,
+        "skip_cache_total": skip_cache_final_count,
+        "skip_cache_added": skip_cache_added_count,
     }
 
 
@@ -481,8 +741,12 @@ async def run_service():
                 print(
                     "Cycle summary: "
                     f"added={result['successfully_added']}, "
+                    f"already_in_group={result['already_in_target_group']}, "
+                    f"skipped_missing_username={result['skipped_missing_username']}, "
+                    f"skipped_by_cache={result['skipped_by_cache']}, "
                     f"failed={result['failed_to_add']}, "
-                    f"processed={result['users_processed']}"
+                    f"processed={result['users_processed']}, "
+                    f"skip_cache_total={result['skip_cache_total']}"
                 )
 
             if not RUN_FOREVER:
