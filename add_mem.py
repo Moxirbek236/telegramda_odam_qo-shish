@@ -127,7 +127,10 @@ def _build_entity_candidates(target):
         candidates.append(raw)
         if raw_abs_text.startswith("100") and len(raw_abs_text) > 10:
             short_id = int(raw_abs_text[3:])
-            candidates.extend([short_id, int(f"-100{short_id}")])
+            # If full channel/supergroup ID is already provided (-100...),
+            # do not down-convert to short id to avoid accidental PeerUser matches.
+            if not text.startswith("-100"):
+                candidates.extend([short_id, int(f"-100{short_id}")])
         elif len(raw_abs_text) <= 10:
             candidates.extend([int(raw_abs_text), int(f"-100{raw_abs_text}")])
 
@@ -153,7 +156,12 @@ async def resolve_group_entity(client, target):
 
     for candidate in candidates:
         try:
-            return await client.get_entity(candidate)
+            entity = await client.get_entity(candidate)
+            if isinstance(entity, (Channel, Chat)):
+                return entity
+            last_error = ValueError(
+                f"Resolved non-group entity ({type(entity).__name__}) for candidate: {candidate}"
+            )
         except Exception as exc:
             last_error = exc
 
