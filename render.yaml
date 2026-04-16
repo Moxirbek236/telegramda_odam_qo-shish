@@ -17,7 +17,7 @@ services:
       - key: TARGET_GROUP_ID
         value: "-1002000540919"
       - key: MAX_SUCCESSFUL_ADDS
-        value: "100"
+        value: "0"
       - key: INVITE_DELAY_SECONDS
         value: "60"
       - key: RUN_FOREVER

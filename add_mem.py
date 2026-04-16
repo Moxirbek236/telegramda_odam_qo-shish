@@ -28,11 +28,14 @@ load_dotenv()
 
 SOURCE_GROUP_ID = read_int_env("SOURCE_GROUP_ID", -1001937901847)
 TARGET_GROUP_ID = read_int_env("TARGET_GROUP_ID", -1002000540919)
-MAX_SUCCESSFUL_ADDS = read_int_env("MAX_SUCCESSFUL_ADDS", 100)
+MAX_SUCCESSFUL_ADDS = read_int_env("MAX_SUCCESSFUL_ADDS", 0)
 INVITE_DELAY_SECONDS = max(0, read_int_env("INVITE_DELAY_SECONDS", 60))
 FLOODWAIT_HEARTBEAT_SECONDS = max(5, read_int_env("FLOODWAIT_HEARTBEAT_SECONDS", 60))
 AUTO_RAISE_DELAY_ON_FLOODWAIT = read_bool_env("AUTO_RAISE_DELAY_ON_FLOODWAIT", True)
 SAFE_DELAY_AFTER_FLOODWAIT = max(10, read_int_env("SAFE_DELAY_AFTER_FLOODWAIT", 60))
+DELAY_AFTER_EACH_USER = read_bool_env("DELAY_AFTER_EACH_USER", True)
+STOP_ON_PEERFLOOD = read_bool_env("STOP_ON_PEERFLOOD", True)
+PEERFLOOD_COOLDOWN_SECONDS = max(60, read_int_env("PEERFLOOD_COOLDOWN_SECONDS", 1800))
 
 CSV_DIR = os.getenv("CSV_DIR", "csv")
 CSV_FILE = os.getenv("CSV_FILE", "scraped_members.csv")
@@ -43,6 +46,8 @@ RUNNING_ON_RENDER = os.getenv("RENDER", "").lower() == "true"
 RUN_FOREVER = read_bool_env("RUN_FOREVER", RUNNING_ON_RENDER)
 IDLE_SLEEP_SECONDS = max(10, read_int_env("IDLE_SLEEP_SECONDS", 300))
 RETRY_ON_FATAL_SECONDS = max(10, read_int_env("RETRY_ON_FATAL_SECONDS", 30))
+SUCCESS_LIMIT_ENABLED = MAX_SUCCESSFUL_ADDS > 0
+SUCCESS_LIMIT_LABEL = str(MAX_SUCCESSFUL_ADDS) if SUCCESS_LIMIT_ENABLED else "unlimited"
 
 api_id_raw = os.getenv("TELEGRAM_API_ID", "").strip()
 api_hash = os.getenv("TELEGRAM_API_HASH", "").strip()
@@ -68,9 +73,12 @@ print("=" * 70)
 
 print("\nConfigured source group:", SOURCE_GROUP_ID)
 print("Configured target group:", TARGET_GROUP_ID)
-print("Success limit:", MAX_SUCCESSFUL_ADDS)
+print("Success limit:", SUCCESS_LIMIT_LABEL)
 print("Invite delay:", INVITE_DELAY_SECONDS, "seconds")
+print("Delay after each user:", DELAY_AFTER_EACH_USER)
 print("FloodWait heartbeat:", FLOODWAIT_HEARTBEAT_SECONDS, "seconds")
+print("Stop on PeerFlood:", STOP_ON_PEERFLOOD)
+print("PeerFlood cooldown:", PEERFLOOD_COOLDOWN_SECONDS, "seconds")
 print("Run forever:", RUN_FOREVER)
 
 
@@ -157,8 +165,33 @@ def render_progress(processed, total, success):
     return (
         f"Progress: [{bar}] {progress:5.1f}% "
         f"| Processed {processed}/{total} "
-        f"| Added {success}/{MAX_SUCCESSFUL_ADDS}"
+        f"| Added {success}/{SUCCESS_LIMIT_LABEL}"
     )
+
+
+def reached_success_limit(success_count):
+    return SUCCESS_LIMIT_ENABLED and success_count >= MAX_SUCCESSFUL_ADDS
+
+
+async def resolve_input_user(username, user_id, access_hash, user_label):
+    # Prefer id+access_hash from CSV to avoid username resolve rate limits.
+    if username and username.lstrip("-").isdigit() and not user_id:
+        user_id = username
+        username = ""
+
+    while True:
+        try:
+            if user_id and access_hash:
+                return InputUser(int(user_id), int(access_hash))
+            if user_id:
+                return await client.get_input_entity(int(user_id))
+            if username:
+                lookup_username = username if username.startswith("@") else f"@{username}"
+                return await client.get_input_entity(lookup_username)
+            raise ValueError("Missing username/user_id in CSV row.")
+        except errors.FloodWaitError as e:
+            print(f"\nFloodWait while resolving {user_label}: {e.seconds} seconds")
+            await wait_with_heartbeat(e.seconds, FLOODWAIT_HEARTBEAT_SECONDS, "Resolve")
 
 
 async def invite_user(group, user):
@@ -184,6 +217,14 @@ async def wait_with_heartbeat(total_seconds, heartbeat_seconds, prefix):
             print(f"{prefix}: {remaining} seconds remaining...")
 
 
+async def wait_between_users(delay_seconds):
+    wait_seconds = int(max(0, delay_seconds))
+    if wait_seconds <= 0:
+        return
+    print(f"\nWaiting {wait_seconds} seconds before next user...")
+    await asyncio.sleep(wait_seconds)
+
+
 async def invite_with_floodwait_retry(target_group, user, user_label, current_invite_delay):
     while True:
         try:
@@ -198,6 +239,25 @@ async def invite_with_floodwait_retry(target_group, user, user_label, current_in
                 print(
                     f"Invite delay auto-updated to {current_invite_delay}s "
                     "to reduce repeated FloodWait blocks."
+                )
+        except errors.PeerFloodError:
+            print(
+                f"\nPeerFlood received for {user_label}. "
+                "Telegram is rate-limiting this account for invites."
+            )
+            if STOP_ON_PEERFLOOD:
+                raise
+
+            await wait_with_heartbeat(
+                PEERFLOOD_COOLDOWN_SECONDS,
+                FLOODWAIT_HEARTBEAT_SECONDS,
+                "PeerFlood cooldown",
+            )
+            if AUTO_RAISE_DELAY_ON_FLOODWAIT and current_invite_delay < SAFE_DELAY_AFTER_FLOODWAIT:
+                current_invite_delay = SAFE_DELAY_AFTER_FLOODWAIT
+                print(
+                    f"Invite delay auto-updated to {current_invite_delay}s "
+                    "after PeerFlood cooldown."
                 )
 
 
@@ -261,19 +321,26 @@ async def main():
     print("=" * 60)
     print(f"CSV file: {csv_path}")
     print(f"Users found in CSV: {total_users}")
-    print(f"Will stop after {MAX_SUCCESSFUL_ADDS} successful additions.")
+    if SUCCESS_LIMIT_ENABLED:
+        print(f"Will stop after {MAX_SUCCESSFUL_ADDS} successful additions.")
+    else:
+        print("No success limit configured. Will process users continuously.")
     current_invite_delay = INVITE_DELAY_SECONDS
-    print(f"Delay between successful invites: {current_invite_delay} seconds")
+    if DELAY_AFTER_EACH_USER:
+        print(f"Delay between processed users: {current_invite_delay} seconds")
+    else:
+        print(f"Delay between successful invites: {current_invite_delay} seconds")
     print("=" * 60)
 
     success_count = 0
     fail_count = 0
     processed_count = 0
+    fatal_stop_reason = ""
 
     print("\n" + render_progress(processed_count, total_users, success_count), end="")
 
     for index, row in enumerate(rows, start=1):
-        if success_count >= MAX_SUCCESSFUL_ADDS:
+        if reached_success_limit(success_count):
             print("\n\nSuccess limit reached. Stopping process.")
             break
 
@@ -288,19 +355,15 @@ async def main():
             print(f"\nSkipped empty row at index {index}")
             fail_count += 1
             print("\r" + render_progress(processed_count, total_users, success_count), end="")
+            if DELAY_AFTER_EACH_USER and processed_count < total_users and not reached_success_limit(success_count):
+                await wait_between_users(current_invite_delay)
             continue
 
         user = None
+        should_wait_before_next_user = DELAY_AFTER_EACH_USER
         try:
             try:
-                if username:
-                    user = await client.get_input_entity(username)
-                elif user_id and access_hash:
-                    user = InputUser(int(user_id), int(access_hash))
-                elif user_id:
-                    user = await client.get_input_entity(int(user_id))
-                else:
-                    raise ValueError("Missing username/user_id in CSV row.")
+                user = await resolve_input_user(username, user_id, access_hash, user_label)
             except (ValueError, errors.rpcerrorlist.UsernameInvalidError, errors.rpcerrorlist.UserIdInvalidError):
                 print(f"\nInvalid user format or not found: {user_label}")
                 fail_count += 1
@@ -322,12 +385,14 @@ async def main():
             print(f"\nAdded: {user_label}")
             print("\r" + render_progress(processed_count, total_users, success_count), end="")
 
-            if success_count >= MAX_SUCCESSFUL_ADDS:
+            if reached_success_limit(success_count):
                 print("\n\nReached configured success limit. Stopping process.")
+                should_wait_before_next_user = False
                 break
 
-            print(f"\nWaiting {current_invite_delay} seconds before next invite...")
-            await asyncio.sleep(current_invite_delay)
+            if not DELAY_AFTER_EACH_USER:
+                print(f"\nWaiting {current_invite_delay} seconds before next invite...")
+                await asyncio.sleep(current_invite_delay)
 
         except errors.UserPrivacyRestrictedError:
             print(f"\nPrivacy restricted: {user_label}")
@@ -344,15 +409,45 @@ async def main():
             fail_count += 1
             print("\r" + render_progress(processed_count, total_users, success_count), end="")
 
+        except errors.PeerFloodError as e:
+            fatal_stop_reason = (
+                f"PeerFlood detected. Account hit invite limit: "
+                f"{type(e).__name__}: {e}"
+            )
+            print(f"\nFATAL: {fatal_stop_reason}")
+            should_wait_before_next_user = False
+            break
+
+        except (
+            errors.UserBannedInChannelError,
+            errors.ChatWriteForbiddenError,
+            errors.ChatAdminRequiredError,
+        ) as e:
+            fatal_stop_reason = (
+                f"Cannot invite members to target group with this account: "
+                f"{type(e).__name__}: {e}"
+            )
+            print(f"\nFATAL: {fatal_stop_reason}")
+            should_wait_before_next_user = False
+            break
+
         except Exception as e:
             print(f"\nFailed: {user_label} -> {type(e).__name__}: {e}")
             fail_count += 1
             print("\r" + render_progress(processed_count, total_users, success_count), end="")
+        finally:
+            if should_wait_before_next_user and processed_count < total_users and not reached_success_limit(success_count):
+                await wait_between_users(current_invite_delay)
 
     print("\n")
 
-    if success_count < MAX_SUCCESSFUL_ADDS and processed_count >= total_users:
-        print("CSV users finished before reaching the success limit.")
+    if processed_count >= total_users:
+        if SUCCESS_LIMIT_ENABLED and not reached_success_limit(success_count):
+            print("CSV users finished before reaching the success limit.")
+        elif not SUCCESS_LIMIT_ENABLED:
+            print("CSV users finished.")
+    elif fatal_stop_reason:
+        print(f"Stopped early due to fatal invite error: {fatal_stop_reason}")
 
     print("\n" + "=" * 60)
     print("PROCESS COMPLETE - SUMMARY")
@@ -361,7 +456,7 @@ async def main():
     print(f"Users processed: {processed_count}")
     print(f"Successfully added: {success_count}")
     print(f"Failed to add: {fail_count}")
-    print(f"Configured success limit: {MAX_SUCCESSFUL_ADDS}")
+    print(f"Configured success limit: {SUCCESS_LIMIT_LABEL}")
     print("=" * 60)
 
     return {
