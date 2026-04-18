@@ -52,6 +52,9 @@ ENABLE_SKIP_CACHE = read_bool_env("ENABLE_SKIP_CACHE", True)
 SKIP_CACHE_FILE = os.getenv("SKIP_CACHE_FILE", "invite_skip_cache.txt")
 PRELOAD_TARGET_MEMBER_IDS = read_bool_env("PRELOAD_TARGET_MEMBER_IDS", True)
 TARGET_MEMBER_PRELOAD_LIMIT = max(0, read_int_env("TARGET_MEMBER_PRELOAD_LIMIT", 200000))
+POST_INVITE_CHECK_ENABLED = read_bool_env("POST_INVITE_CHECK_ENABLED", True)
+POST_INVITE_CHECK_ATTEMPTS = max(1, read_int_env("POST_INVITE_CHECK_ATTEMPTS", 3))
+POST_INVITE_CHECK_DELAY_SECONDS = max(0, read_int_env("POST_INVITE_CHECK_DELAY_SECONDS", 8))
 
 CSV_DIR = os.getenv("CSV_DIR", "csv")
 CSV_FILE = os.getenv("CSV_FILE", "scraped_members.csv")
@@ -101,6 +104,10 @@ else:
     print("Max accepted FloodWait: disabled (wait any duration)")
 print("Skip cache enabled:", ENABLE_SKIP_CACHE)
 print("Preload target members:", PRELOAD_TARGET_MEMBER_IDS)
+print("Post-invite verification:", POST_INVITE_CHECK_ENABLED)
+if POST_INVITE_CHECK_ENABLED:
+    print("Post-invite verify attempts:", POST_INVITE_CHECK_ATTEMPTS)
+    print("Post-invite verify delay:", POST_INVITE_CHECK_DELAY_SECONDS, "seconds")
 print("Run forever:", RUN_FOREVER)
 
 
@@ -195,7 +202,7 @@ def render_progress(processed, total, success):
     return (
         f"Progress: [{bar}] {progress:5.1f}% "
         f"| Processed {processed}/{total} "
-        f"| Added {success}/{SUCCESS_LIMIT_LABEL}"
+        f"| Confirmed {success}/{SUCCESS_LIMIT_LABEL}"
     )
 
 
@@ -295,36 +302,117 @@ async def invite_user(group, user):
         raise TypeError(f"Unsupported group type: {type(group).__name__}")
 
 
-async def is_user_already_in_group(group, user, user_label):
-    # Pre-check is only available for Channel/Supergroup via GetParticipantRequest.
-    if not isinstance(group, Channel):
-        return False
+async def get_membership_state(group, user, resolved_user_id, user_label, check_label):
+    if isinstance(group, Channel):
+        while True:
+            try:
+                await client(GetParticipantRequest(group, user))
+                return "member"
+            except (
+                errors.UserNotParticipantError,
+                errors.ParticipantIdInvalidError,
+                errors.UserIdInvalidError,
+            ):
+                return "not_member"
+            except errors.ChatAdminRequiredError:
+                print(
+                    f"\n{check_label} could not verify membership for {user_label}: "
+                    "additional admin rights required."
+                )
+                return "unknown"
+            except errors.FloodWaitError as e:
+                print(
+                    f"\nFloodWait while checking membership for {user_label}: "
+                    f"{e.seconds} seconds"
+                )
+                await wait_with_heartbeat(
+                    e.seconds,
+                    FLOODWAIT_HEARTBEAT_SECONDS,
+                    "Membership check",
+                )
+            except Exception as e:
+                print(
+                    f"\n{check_label} membership check failed for {user_label}: "
+                    f"{type(e).__name__}: {e}"
+                )
+                return "unknown"
 
+    if not isinstance(group, Chat):
+        print(
+            f"\n{check_label} could not verify membership for {user_label}: "
+            f"unsupported group type {type(group).__name__}."
+        )
+        return "unknown"
+
+    if not resolved_user_id or not resolved_user_id.lstrip("-").isdigit():
+        print(
+            f"\n{check_label} could not verify membership for {user_label}: "
+            "missing numeric user_id."
+        )
+        return "unknown"
+
+    target_user_id = int(resolved_user_id)
     while True:
         try:
-            await client(GetParticipantRequest(group, user))
-            return True
-        except (
-            errors.UserNotParticipantError,
-            errors.ParticipantIdInvalidError,
-            errors.UserIdInvalidError,
-        ):
-            return False
+            async for participant in client.iter_participants(group):
+                if participant.id == target_user_id:
+                    return "member"
+            return "not_member"
         except errors.ChatAdminRequiredError:
             print(
-                "\nMembership pre-check requires additional admin rights. "
-                "Falling back to direct invite attempt."
+                f"\n{check_label} could not verify membership for {user_label}: "
+                "additional admin rights required."
             )
-            return False
+            return "unknown"
         except errors.FloodWaitError as e:
             print(f"\nFloodWait while checking membership for {user_label}: {e.seconds} seconds")
             await wait_with_heartbeat(e.seconds, FLOODWAIT_HEARTBEAT_SECONDS, "Membership check")
         except Exception as e:
             print(
-                f"\nMembership check failed for {user_label}: "
-                f"{type(e).__name__}: {e}. Trying invite directly."
+                f"\n{check_label} membership check failed for {user_label}: "
+                f"{type(e).__name__}: {e}"
             )
-            return False
+            return "unknown"
+
+
+async def is_user_already_in_group(group, user, resolved_user_id, user_label):
+    membership_state = await get_membership_state(
+        group,
+        user,
+        resolved_user_id,
+        user_label,
+        "Pre-invite check",
+    )
+    return membership_state == "member"
+
+
+async def verify_post_invite_membership(group, user, resolved_user_id, user_label):
+    if not POST_INVITE_CHECK_ENABLED:
+        return "confirmed"
+
+    for attempt in range(1, POST_INVITE_CHECK_ATTEMPTS + 1):
+        membership_state = await get_membership_state(
+            group,
+            user,
+            resolved_user_id,
+            user_label,
+            "Post-invite check",
+        )
+        if membership_state == "member":
+            return "confirmed"
+        if membership_state == "unknown":
+            return "unknown"
+
+        if attempt < POST_INVITE_CHECK_ATTEMPTS:
+            print(
+                f"\nPost-invite check pending for {user_label}: "
+                f"not visible in target group yet "
+                f"(attempt {attempt}/{POST_INVITE_CHECK_ATTEMPTS}). "
+                f"Retrying in {POST_INVITE_CHECK_DELAY_SECONDS} seconds..."
+            )
+            await asyncio.sleep(POST_INVITE_CHECK_DELAY_SECONDS)
+
+    return "not_confirmed"
 
 
 async def preload_target_member_ids(group):
@@ -482,7 +570,7 @@ async def main():
         print("Run mem_scrap.py first to scrape source group members.")
         return
 
-    skipped_missing_username_in_csv = 0
+    skipped_missing_identity_in_csv = 0
     with open(csv_path, encoding="utf-8") as f:
         reader = csv.reader(f)
         next(reader, None)
@@ -491,8 +579,9 @@ async def main():
             if not row:
                 continue
             username_in_row = row[0].strip() if len(row) > 0 else ""
-            if not username_in_row:
-                skipped_missing_username_in_csv += 1
+            user_id_in_row = row[1].strip() if len(row) > 1 else ""
+            if not username_in_row and not user_id_in_row.lstrip("-").isdigit():
+                skipped_missing_identity_in_csv += 1
                 continue
             rows.append(row)
 
@@ -506,26 +595,28 @@ async def main():
     print("=" * 60)
     print(f"CSV file: {csv_path}")
     print(f"Users found in CSV: {total_users}")
-    if skipped_missing_username_in_csv > 0:
+    if skipped_missing_identity_in_csv > 0:
         print(
-            "Skipped before processing (missing username in CSV): "
-            f"{skipped_missing_username_in_csv}"
+            "Skipped before processing (missing username and user_id in CSV): "
+            f"{skipped_missing_identity_in_csv}"
         )
     if SUCCESS_LIMIT_ENABLED:
-        print(f"Will stop after {MAX_SUCCESSFUL_ADDS} successful additions.")
+        print(f"Will stop after {MAX_SUCCESSFUL_ADDS} confirmed additions.")
     else:
         print("No success limit configured. Will process users continuously.")
     current_invite_delay = INVITE_DELAY_SECONDS
     if DELAY_AFTER_EACH_USER:
         print(f"Delay between processed users: {current_invite_delay} seconds")
     else:
-        print(f"Delay between successful invites: {current_invite_delay} seconds")
+        print(f"Delay between invite attempts: {current_invite_delay} seconds")
     print("=" * 60)
 
     success_count = 0
     fail_count = 0
     already_in_group_count = 0
-    skipped_missing_username_count = 0
+    not_confirmed_after_invite_count = 0
+    unverified_after_invite_count = 0
+    skipped_missing_identity_count = 0
     skipped_by_cache_count = 0
     processed_count = 0
     fatal_stop_reason = ""
@@ -542,12 +633,12 @@ async def main():
         username = row[0].strip() if len(row) > 0 else ""
         user_id = row[1].strip() if len(row) > 1 else ""
         access_hash = row[2].strip() if len(row) > 2 else ""
-        user_label = username or f"row-{index}"
+        user_label = username or user_id or f"row-{index}"
         row_keys = build_user_keys(username, user_id)
 
-        if not username:
-            skipped_missing_username_count += 1
-            print(f"\nSkipped (username missing) at index {index}")
+        if not username and not user_id.lstrip("-").isdigit():
+            skipped_missing_identity_count += 1
+            print(f"\nSkipped (missing username and user_id) at index {index}")
             print("\r" + render_progress(processed_count, total_users, success_count), end="")
             continue
 
@@ -566,6 +657,7 @@ async def main():
             continue
 
         user = None
+        invite_attempt_completed = False
         should_wait_before_next_user = DELAY_AFTER_EACH_USER
         try:
             try:
@@ -586,7 +678,7 @@ async def main():
             resolved_user_id = str(getattr(user, "user_id", "") or user_id).strip()
             resolved_keys = build_user_keys(username, resolved_user_id or user_id)
 
-            if await is_user_already_in_group(target_group, user, user_label):
+            if await is_user_already_in_group(target_group, user, resolved_user_id, user_label):
                 already_in_group_count += 1
                 if ENABLE_SKIP_CACHE:
                     skip_keys.update(resolved_keys)
@@ -600,10 +692,33 @@ async def main():
                 user_label,
                 current_invite_delay,
             )
-            success_count += 1
-            if resolved_user_id and resolved_user_id.lstrip("-").isdigit():
-                target_member_ids.add(int(resolved_user_id))
-            print(f"\nAdded: {user_label}")
+            invite_attempt_completed = True
+
+            verification_result = await verify_post_invite_membership(
+                target_group,
+                user,
+                resolved_user_id,
+                user_label,
+            )
+
+            if verification_result == "confirmed":
+                success_count += 1
+                if resolved_user_id and resolved_user_id.lstrip("-").isdigit():
+                    target_member_ids.add(int(resolved_user_id))
+                print(f"\nConfirmed added: {user_label}")
+            elif verification_result == "unknown":
+                unverified_after_invite_count += 1
+                print(
+                    f"\nInvite sent but membership could not be verified: {user_label}"
+                )
+            else:
+                not_confirmed_after_invite_count += 1
+                fail_count += 1
+                print(
+                    f"\nInvite request returned without error, but user is still not "
+                    f"in target group: {user_label}"
+                )
+
             print("\r" + render_progress(processed_count, total_users, success_count), end="")
 
             if reached_success_limit(success_count):
@@ -611,7 +726,7 @@ async def main():
                 should_wait_before_next_user = False
                 break
 
-            if not DELAY_AFTER_EACH_USER:
+            if invite_attempt_completed and not DELAY_AFTER_EACH_USER:
                 print(f"\nWaiting {current_invite_delay} seconds before next invite...")
                 await asyncio.sleep(current_invite_delay)
 
@@ -712,9 +827,11 @@ async def main():
     print("=" * 60)
     print(f"Users in CSV: {total_users}")
     print(f"Users processed: {processed_count}")
-    print(f"Successfully added: {success_count}")
+    print(f"Confirmed added to target group: {success_count}")
     print(f"Already in target group (skipped): {already_in_group_count}")
-    print(f"Skipped (username missing): {skipped_missing_username_count}")
+    print(f"Invite sent but not confirmed in group: {not_confirmed_after_invite_count}")
+    print(f"Invite sent but could not verify: {unverified_after_invite_count}")
+    print(f"Skipped (missing username and user_id): {skipped_missing_identity_count}")
     print(f"Skipped by cache: {skipped_by_cache_count}")
     print(f"Failed to add: {fail_count}")
     print(f"Configured success limit: {SUCCESS_LIMIT_LABEL}")
@@ -727,7 +844,9 @@ async def main():
         "users_processed": processed_count,
         "successfully_added": success_count,
         "already_in_target_group": already_in_group_count,
-        "skipped_missing_username": skipped_missing_username_count,
+        "not_confirmed_after_invite": not_confirmed_after_invite_count,
+        "unverified_after_invite": unverified_after_invite_count,
+        "skipped_missing_identity": skipped_missing_identity_count,
         "skipped_by_cache": skipped_by_cache_count,
         "failed_to_add": fail_count,
         "skip_cache_total": skip_cache_final_count,
@@ -748,9 +867,11 @@ async def run_service():
             if result:
                 print(
                     "Cycle summary: "
-                    f"added={result['successfully_added']}, "
+                    f"confirmed_added={result['successfully_added']}, "
                     f"already_in_group={result['already_in_target_group']}, "
-                    f"skipped_missing_username={result['skipped_missing_username']}, "
+                    f"not_confirmed={result['not_confirmed_after_invite']}, "
+                    f"unverified={result['unverified_after_invite']}, "
+                    f"skipped_missing_identity={result['skipped_missing_identity']}, "
                     f"skipped_by_cache={result['skipped_by_cache']}, "
                     f"failed={result['failed_to_add']}, "
                     f"processed={result['users_processed']}, "
