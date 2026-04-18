@@ -8,6 +8,14 @@ import asyncio
 import contextlib
 from dotenv import load_dotenv
 import os
+import sys
+
+
+RUNNING_UNDER_PM2 = "PM2_HOME" in os.environ or "pm_id" in os.environ
+DOTENV_OVERRIDE = os.getenv(
+    "DOTENV_OVERRIDE",
+    "true" if RUNNING_UNDER_PM2 else "false",
+).strip().lower() in ("1", "true", "yes", "on")
 
 
 def read_int_env(key, default):
@@ -35,7 +43,7 @@ def read_group_target_env(key, default):
     return value
 
 
-load_dotenv()
+load_dotenv(override=DOTENV_OVERRIDE)
 
 SOURCE_GROUP_ID = read_group_target_env("SOURCE_GROUP_ID", -1001937901847)
 TARGET_GROUP_ID = read_group_target_env("TARGET_GROUP_ID", -1002000540919)
@@ -65,6 +73,14 @@ RUNNING_ON_RENDER = os.getenv("RENDER", "").lower() == "true"
 RUN_FOREVER = read_bool_env("RUN_FOREVER", RUNNING_ON_RENDER)
 IDLE_SLEEP_SECONDS = max(10, read_int_env("IDLE_SLEEP_SECONDS", 300))
 RETRY_ON_FATAL_SECONDS = max(10, read_int_env("RETRY_ON_FATAL_SECONDS", 30))
+PM2_HOLD_ON_EXIT = read_bool_env(
+    "PM2_HOLD_ON_EXIT",
+    RUNNING_UNDER_PM2 and not RUN_FOREVER,
+)
+PM2_HOLD_HEARTBEAT_SECONDS = max(
+    30,
+    read_int_env("PM2_HOLD_HEARTBEAT_SECONDS", 300),
+)
 SUCCESS_LIMIT_ENABLED = MAX_SUCCESSFUL_ADDS > 0
 SUCCESS_LIMIT_LABEL = str(MAX_SUCCESSFUL_ADDS) if SUCCESS_LIMIT_ENABLED else "unlimited"
 
@@ -73,6 +89,14 @@ api_hash = os.getenv("TELEGRAM_API_HASH", "").strip()
 if not api_id_raw or not api_hash:
     raise RuntimeError("Missing TELEGRAM_API_ID or TELEGRAM_API_HASH environment variables.")
 api_id = int(api_id_raw)
+
+
+def resolve_file_session_path(session_name):
+    return os.path.abspath(f"{session_name}.session")
+
+
+FILE_SESSION_PATH = resolve_file_session_path(SESSION_NAME)
+SESSION_BACKEND_LABEL = "StringSession" if SESSION_STRING else "FileSession"
 
 if SESSION_STRING:
     client = TelegramClient(StringSession(SESSION_STRING), api_id, api_hash)
@@ -92,6 +116,17 @@ print("=" * 70)
 
 print("\nConfigured source group:", SOURCE_GROUP_ID)
 print("Configured target group:", TARGET_GROUP_ID)
+print("Dotenv override enabled:", DOTENV_OVERRIDE)
+print("Session backend:", SESSION_BACKEND_LABEL)
+if SESSION_STRING:
+    print("Session source: TELEGRAM_SESSION_STRING")
+else:
+    print("Session file:", FILE_SESSION_PATH)
+    if RUNNING_ON_RENDER or RUNNING_UNDER_PM2 or not sys.stdin.isatty():
+        print(
+            "Warning: TELEGRAM_SESSION_STRING is empty in a headless environment. "
+            "The local .session file must be writable."
+        )
 print("Success limit:", SUCCESS_LIMIT_LABEL)
 print("Invite delay:", INVITE_DELAY_SECONDS, "seconds")
 print("Delay after each user:", DELAY_AFTER_EACH_USER)
@@ -109,6 +144,14 @@ if POST_INVITE_CHECK_ENABLED:
     print("Post-invite verify attempts:", POST_INVITE_CHECK_ATTEMPTS)
     print("Post-invite verify delay:", POST_INVITE_CHECK_DELAY_SECONDS, "seconds")
 print("Run forever:", RUN_FOREVER)
+if RUNNING_UNDER_PM2 and not RUN_FOREVER:
+    print(
+        "Warning: PM2 auto-restarts processes by default. "
+        "With RUN_FOREVER=False, this worker can loop unless PM2 autorestart is disabled."
+    )
+    print("PM2 hold on exit:", PM2_HOLD_ON_EXIT)
+    if PM2_HOLD_ON_EXIT:
+        print("PM2 hold heartbeat:", PM2_HOLD_HEARTBEAT_SECONDS, "seconds")
 
 
 def _build_entity_candidates(target):
@@ -270,6 +313,28 @@ class ExcessiveFloodWaitError(RuntimeError):
         self.seconds = int(seconds)
         self.user_label = user_label
         super().__init__(f"FloodWait {self.seconds}s for {self.user_label}")
+
+
+def ensure_file_session_is_writable():
+    if SESSION_STRING:
+        return
+
+    session_dir = os.path.dirname(FILE_SESSION_PATH) or os.getcwd()
+    if os.path.exists(FILE_SESSION_PATH):
+        if os.access(FILE_SESSION_PATH, os.W_OK):
+            return
+        raise RuntimeError(
+            "Telegram session file is not writable: "
+            f"{FILE_SESSION_PATH}. Fix file permissions or set TELEGRAM_SESSION_STRING."
+        )
+
+    if os.access(session_dir, os.W_OK):
+        return
+
+    raise RuntimeError(
+        "Telegram session directory is not writable: "
+        f"{session_dir}. Fix directory permissions or set TELEGRAM_SESSION_STRING."
+    )
 
 
 async def resolve_input_user(username, user_id, access_hash, user_label):
@@ -473,6 +538,27 @@ async def wait_between_users(delay_seconds):
     await asyncio.sleep(wait_seconds)
 
 
+async def disconnect_client_if_needed():
+    if client.is_connected():
+        with contextlib.suppress(Exception):
+            await client.disconnect()
+
+
+async def hold_process_for_pm2(reason):
+    await disconnect_client_if_needed()
+    print(f"\nPM2 hold: {reason}")
+    print(
+        "Process will stay idle to avoid PM2 immediately restarting "
+        "this one-shot worker."
+    )
+    while True:
+        await wait_with_heartbeat(
+            PM2_HOLD_HEARTBEAT_SECONDS,
+            PM2_HOLD_HEARTBEAT_SECONDS,
+            "PM2 idle",
+        )
+
+
 async def invite_with_floodwait_retry(target_group, user, user_label, current_invite_delay):
     while True:
         try:
@@ -514,6 +600,8 @@ async def invite_with_floodwait_retry(target_group, user, user_label, current_in
 async def start_client():
     if client.is_connected():
         return
+
+    ensure_file_session_is_writable()
 
     if SESSION_STRING:
         await client.connect()
@@ -880,6 +968,10 @@ async def run_service():
 
             if not RUN_FOREVER:
                 print("RUN_FOREVER is disabled. Worker is stopping after this cycle.")
+                if PM2_HOLD_ON_EXIT:
+                    await hold_process_for_pm2(
+                        "Cycle finished while RUN_FOREVER=False."
+                    )
                 return
 
             await wait_with_heartbeat(IDLE_SLEEP_SECONDS, FLOODWAIT_HEARTBEAT_SECONDS, "Idle")
@@ -889,6 +981,10 @@ async def run_service():
         except Exception as e:
             print(f"\nWorker cycle failed: {type(e).__name__}: {e}")
             if not RUN_FOREVER:
+                if PM2_HOLD_ON_EXIT:
+                    await hold_process_for_pm2(
+                        f"Fatal one-shot worker error: {type(e).__name__}: {e}"
+                    )
                 raise
 
             if client.is_connected():
